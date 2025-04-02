@@ -1,0 +1,6 @@
+.env
+/contractcompare_env
+__pycache__
+chroma_db
+instructions.MD
+master_documents
