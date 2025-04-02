@@ -20,28 +20,145 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
+class ModelProvider:
+    """
+    A class to provide different LLM models for document comparison.
+    """
+    
+    def __init__(self, model_type: str = "openai", temperature: float = 0.0):
+        """
+        Initialize the ModelProvider with the specified model type.
+        
+        Args:
+            model_type: Type of model to use ('openai' or 'saul')
+            temperature: Temperature setting for the LLM
+        """
+        self.model_type = model_type
+        self.temperature = temperature
+        self._initialize_model()
+    
+    def _initialize_model(self):
+        """Initialize the appropriate model based on model_type."""
+        if self.model_type == "openai":
+            self.llm = ChatOpenAI(
+                temperature=self.temperature,
+                model_name="gpt-4",  # Can be configured based on requirements
+                request_timeout=120  # Add timeout of 120 seconds per request
+            )
+            logger.info("Initialized OpenAI GPT-4 model")
+        elif self.model_type == "saul":
+            # Import necessary libraries for Saul model
+            try:
+                import torch
+                from transformers import pipeline
+                
+                # Initialize the Saul model pipeline
+                self.pipeline = pipeline(
+                    "text-generation", 
+                    model="Equall/Saul-Instruct-v1", 
+                    torch_dtype=torch.bfloat16, 
+                    device_map="auto"
+                )
+                logger.info("Initialized Saul-Instruct-v1 model")
+            except ImportError as e:
+                logger.error(f"Failed to import required libraries for Saul model: {str(e)}")
+                # Fallback to OpenAI
+                self.model_type = "openai"
+                self.llm = ChatOpenAI(
+                    temperature=self.temperature,
+                    model_name="gpt-4",
+                    request_timeout=120
+                )
+                logger.warning("Falling back to OpenAI GPT-4 model due to import error")
+        else:
+            logger.warning(f"Unknown model type: {self.model_type}, defaulting to OpenAI")
+            self.model_type = "openai"
+            self.llm = ChatOpenAI(
+                temperature=self.temperature,
+                model_name="gpt-4",
+                request_timeout=120
+            )
+    
+    def run_chain(self, prompt: PromptTemplate, **kwargs) -> str:
+        """
+        Run the LLM chain with the given prompt and kwargs.
+        
+        Args:
+            prompt: The prompt template to use
+            **kwargs: The keyword arguments to pass to the prompt
+            
+        Returns:
+            The generated text
+        """
+        if self.model_type == "openai":
+            # Use LangChain for OpenAI
+            chain = LLMChain(llm=self.llm, prompt=prompt)
+            return chain.run(**kwargs)
+        elif self.model_type == "saul":
+            # Format the prompt for Saul model
+            formatted_prompt = prompt.format(**kwargs)
+            
+            # Create a chat message format
+            messages = [
+                {"role": "user", "content": formatted_prompt},
+            ]
+            
+            # Apply chat template
+            prompt_text = self.pipeline.tokenizer.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            
+            # Generate response
+            outputs = self.pipeline(
+                prompt_text, 
+                max_new_tokens=1024,  # Adjust as needed
+                do_sample=False
+            )
+            
+            # Extract the generated text, removing the prompt
+            generated_text = outputs[0]["generated_text"]
+            
+            # Remove the prompt part from the generated text
+            response = generated_text[len(prompt_text):].strip()
+            
+            return response
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
+    
+    def get_llm(self):
+        """
+        Get the LLM instance for use with LangChain components.
+        Only applicable for OpenAI models.
+        
+        Returns:
+            The LLM instance
+        """
+        if self.model_type == "openai":
+            return self.llm
+        else:
+            raise ValueError(f"Direct LLM access not available for model type: {self.model_type}")
+
 class ComparisonEngine:
     """
     A class for comparing legal documents using RAG (Retrieval Augmented Generation).
     """
     
-    def __init__(self, temperature: float = 0.0, persist_directory: str = "./chroma_db"):
+    def __init__(self, temperature: float = 0.0, persist_directory: str = "./chroma_db", model_type: str = "openai"):
         """
         Initialize the ComparisonEngine with necessary components.
         
         Args:
             temperature: Temperature setting for the LLM
             persist_directory: Directory to persist vector databases
+            model_type: Type of model to use ('openai' or 'saul')
         """
         # Initialize OpenAI embeddings
         self.embeddings = OpenAIEmbeddings()
         
-        # Initialize LLM
-        self.llm = ChatOpenAI(
-            temperature=temperature,
-            model_name="gpt-4",  # Can be configured based on requirements
-            request_timeout=120  # Add timeout of 120 seconds per request
-        )
+        # Initialize model provider
+        self.model_provider = ModelProvider(model_type=model_type, temperature=temperature)
         
         # Set persistence directory
         self.persist_directory = persist_directory
@@ -161,10 +278,42 @@ class ComparisonEngine:
         """
         prompt = PromptTemplate(template=prompt_template, input_variables=["context"])
         
-        compressor = LLMChainExtractor.from_llm(
-            llm=self.llm,
-            prompt=prompt
-        )
+        # Use the appropriate LLM based on model type
+        if self.model_provider.model_type == "openai":
+            compressor = LLMChainExtractor.from_llm(
+                llm=self.model_provider.get_llm(),
+                prompt=prompt
+            )
+        else:
+            # For non-OpenAI models, we need a custom compressor
+            # This is a simplified version that doesn't use LangChain's LLMChainExtractor
+            from langchain.schema import Document
+            
+            class CustomCompressor:
+                def __init__(self, model_provider, prompt):
+                    self.model_provider = model_provider
+                    self.prompt = prompt
+                
+                def compress_documents(self, documents, query):
+                    compressed_docs = []
+                    for doc in documents:
+                        try:
+                            compressed_text = self.model_provider.run_chain(
+                                self.prompt, 
+                                context=doc.page_content
+                            )
+                            compressed_docs.append(
+                                Document(
+                                    page_content=compressed_text,
+                                    metadata=doc.metadata
+                                )
+                            )
+                        except Exception as e:
+                            logger.error(f"Error compressing document: {str(e)}")
+                            compressed_docs.append(doc)  # Use original if compression fails
+                    return compressed_docs
+            
+            compressor = CustomCompressor(self.model_provider, prompt)
         
         # Create a contextual compression retriever
         compression_retriever = ContextualCompressionRetriever(
@@ -255,6 +404,17 @@ class ComparisonEngine:
         - MODERATE: Notable differences that should be addressed but aren't deal-breakers
         - MAJOR: Critical differences that present significant legal or business risks
         
+        Also, for each discrepancy, classify it as:
+        - ACTION_NEEDED: The discrepancy needs to be addressed (e.g., client document contradicts master document in a way that creates risk)
+        - ACCEPTABLE: The discrepancy is acceptable (e.g., master document has provisions that client document lacks, but this is beneficial to the company)
+        
+        When determining if a discrepancy is ACCEPTABLE or ACTION_NEEDED, consider:
+        - If master document has stronger protections that are missing from client document, this is likely ACTION_NEEDED
+        - If master document has provisions that benefit the company and are missing from client document, this is likely ACTION_NEEDED
+        - If client document has additional obligations not in master document, this is likely ACTION_NEEDED
+        - If client document has weaker language than master document, this is likely ACTION_NEEDED
+        - If master document has termination rights, liability limitations, or other protective clauses missing from client document, this may be ACCEPTABLE if it's beneficial to maintain these differences
+        
         Format your response as a structured analysis with clear headings and bullet points.
         """
         
@@ -263,16 +423,12 @@ class ComparisonEngine:
             input_variables=["category", "master_text", "client_text"]
         )
         
-        # Create and run comparison chain
-        comparison_chain = LLMChain(
-            llm=self.llm,
-            prompt=comparison_prompt
-        )
-        
+        # Run comparison using the model provider
         logger.info(f"Running LLM comparison for '{category}'")
         llm_start = time.time()
         try:
-            response = comparison_chain.run(
+            response = self.model_provider.run_chain(
+                comparison_prompt,
                 category=category,
                 master_text=master_text,
                 client_text=client_text
@@ -312,7 +468,7 @@ class ComparisonEngine:
         
         # Use LLM to extract structured discrepancies
         extraction_template = """
-        Extract the discrepancies, their severity, and proposed solutions from the following analysis:
+        Extract the discrepancies, their severity, proposed solutions, and action classification from the following analysis:
         
         {analysis}
         
@@ -321,6 +477,8 @@ class ComparisonEngine:
         - severity: MINOR, MODERATE, or MAJOR
         - solution: The proposed solution for this discrepancy
         - category: The category this discrepancy belongs to (e.g., "Liability provisions")
+        - action_needed: true if the discrepancy needs to be addressed, false if it's acceptable as is
+        - rationale: A brief explanation of why action is or is not needed
         
         Response:
         """
@@ -330,13 +488,8 @@ class ComparisonEngine:
             input_variables=["analysis"]
         )
         
-        extraction_chain = LLMChain(
-            llm=self.llm,
-            prompt=extraction_prompt
-        )
-        
         try:
-            extraction_result = extraction_chain.run(analysis=analysis)
+            extraction_result = self.model_provider.run_chain(extraction_prompt, analysis=analysis)
             
             # Parse the JSON response - in a production system, add better error handling
             import json
@@ -394,14 +547,14 @@ class ComparisonEngine:
             input_variables=["categories_summary"]
         )
         
-        # Create and run summary chain
-        summary_chain = LLMChain(
-            llm=self.llm,
-            prompt=summary_prompt
-        )
-        
-        return summary_chain.run(categories_summary=categories_summary)
-
+        try:
+            summary = self.model_provider.run_chain(summary_prompt, categories_summary=categories_summary)
+        except Exception as e:
+            logger.error(f"Error generating overall summary: {str(e)}")
+            summary = "Error generating summary. Please review individual category analyses."
+            
+        return summary
+    
     def generate_annotated_pdf(self, 
                               pdf_path: str, 
                               discrepancies: List[Dict[str, Any]]) -> Tuple[str, bytes]:
@@ -544,7 +697,7 @@ class ComparisonEngine:
         )
         
         identification_chain = LLMChain(
-            llm=self.llm,
+            llm=self.model_provider.get_llm(),
             prompt=identification_prompt
         )
         

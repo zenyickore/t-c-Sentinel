@@ -69,6 +69,20 @@ st.markdown("""
         padding: 0.1rem 0.3rem;
         border-radius: 0.25rem;
     }
+    .action-needed {
+        background-color: #FEE2E2;
+        color: #B91C1C;
+        padding: 0.1rem 0.3rem;
+        border-radius: 0.25rem;
+        font-weight: bold;
+    }
+    .acceptable {
+        background-color: #D1FAE5;
+        color: #065F46;
+        padding: 0.1rem 0.3rem;
+        border-radius: 0.25rem;
+        font-weight: bold;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -106,13 +120,21 @@ def main():
         temperature = st.slider("LLM Temperature", min_value=0.0, max_value=1.0, value=0.0, step=0.1,
                                help="Higher values make output more random, lower values more deterministic")
         
+        # Model selection
+        model_type = st.selectbox(
+            "Model Type",
+            options=["openai", "saul"],
+            index=0,
+            help="Select the model to use for analysis (OpenAI GPT-4 or Saul-Instruct-v1)"
+        )
+        
         # Master document management
         st.subheader("Master Document Management")
         if st.session_state.has_master_document:
             st.success(f"Current master: {st.session_state.master_filename}")
             if st.button("Clear Master Document"):
                 # Initialize comparison engine
-                comparison_engine = ComparisonEngine(temperature=temperature)
+                comparison_engine = ComparisonEngine(temperature=temperature, model_type=model_type)
                 # Delete the master vector database
                 comparison_engine.delete_vector_db("master")
                 # Reset session state
@@ -143,7 +165,8 @@ def main():
     )
     
     comparison_engine = ComparisonEngine(
-        temperature=temperature
+        temperature=temperature,
+        model_type=model_type
     )
     
     # Main content area
@@ -358,13 +381,41 @@ def main():
                 # Discrepancies with severity and solutions
                 if "discrepancies" in result and result["discrepancies"]:
                     st.subheader("Detailed Discrepancies")
+                    
+                    # Separate discrepancies by action needed
+                    action_needed = []
+                    acceptable = []
+                    
                     for disc in result["discrepancies"]:
-                        severity_class = f"severity-{disc['severity'].lower()}" if "severity" in disc else "severity-minor"
-                        
-                        with st.expander(f"{disc.get('description', 'Discrepancy')} [{disc.get('severity', 'MINOR')}]"):
-                            st.markdown(f"**Description:** {disc.get('description', 'No description available')}")
-                            st.markdown(f"**Severity:** <span class='{severity_class}'>{disc.get('severity', 'MINOR')}</span>", unsafe_allow_html=True)
-                            st.markdown(f"**Proposed Solution:** {disc.get('solution', 'No solution provided')}")
+                        if disc.get("action_needed", True):
+                            action_needed.append(disc)
+                        else:
+                            acceptable.append(disc)
+                    
+                    # Display discrepancies that need action first
+                    if action_needed:
+                        st.markdown("### Discrepancies Requiring Action")
+                        for disc in action_needed:
+                            severity_class = f"severity-{disc['severity'].lower()}" if "severity" in disc else "severity-minor"
+                            
+                            with st.expander(f"{disc.get('description', 'Discrepancy')} [{disc.get('severity', 'MINOR')}] - ACTION NEEDED"):
+                                st.markdown(f"**Description:** {disc.get('description', 'No description available')}")
+                                st.markdown(f"**Severity:** <span class='{severity_class}'>{disc.get('severity', 'MINOR')}</span>", unsafe_allow_html=True)
+                                st.markdown(f"**Action Required:** <span class='action-needed'>YES</span>", unsafe_allow_html=True)
+                                st.markdown(f"**Rationale:** {disc.get('rationale', 'No rationale provided')}")
+                                st.markdown(f"**Proposed Solution:** {disc.get('solution', 'No solution provided')}")
+                    
+                    # Display acceptable discrepancies
+                    if acceptable:
+                        st.markdown("### Acceptable Discrepancies")
+                        for disc in acceptable:
+                            severity_class = f"severity-{disc['severity'].lower()}" if "severity" in disc else "severity-minor"
+                            
+                            with st.expander(f"{disc.get('description', 'Discrepancy')} [{disc.get('severity', 'MINOR')}] - ACCEPTABLE"):
+                                st.markdown(f"**Description:** {disc.get('description', 'No description available')}")
+                                st.markdown(f"**Severity:** <span class='{severity_class}'>{disc.get('severity', 'MINOR')}</span>", unsafe_allow_html=True)
+                                st.markdown(f"**Action Required:** <span class='acceptable'>NO</span>", unsafe_allow_html=True)
+                                st.markdown(f"**Rationale:** {disc.get('rationale', 'No rationale provided')}")
                 
                 # Source sections
                 with st.expander("View Source Sections"):
@@ -393,11 +444,32 @@ def main():
                 
                 # Add discrepancies details
                 if "discrepancies" in result and result["discrepancies"]:
-                    report_content += "### Detailed Discrepancies\n\n"
+                    # Separate discrepancies by action needed
+                    action_needed = []
+                    acceptable = []
+                    
                     for disc in result["discrepancies"]:
-                        report_content += f"**{disc.get('description', 'Discrepancy')} [{disc.get('severity', 'MINOR')}]**\n\n"
-                        report_content += f"- **Severity:** {disc.get('severity', 'MINOR')}\n"
-                        report_content += f"- **Proposed Solution:** {disc.get('solution', 'No solution provided')}\n\n"
+                        if disc.get("action_needed", True):
+                            action_needed.append(disc)
+                        else:
+                            acceptable.append(disc)
+                    
+                    # Add discrepancies that need action
+                    if action_needed:
+                        report_content += "### Discrepancies Requiring Action\n\n"
+                        for disc in action_needed:
+                            report_content += f"**{disc.get('description', 'Discrepancy')} [{disc.get('severity', 'MINOR')}] - ACTION NEEDED**\n\n"
+                            report_content += f"- **Severity:** {disc.get('severity', 'MINOR')}\n"
+                            report_content += f"- **Rationale:** {disc.get('rationale', 'No rationale provided')}\n"
+                            report_content += f"- **Proposed Solution:** {disc.get('solution', 'No solution provided')}\n\n"
+                    
+                    # Add acceptable discrepancies
+                    if acceptable:
+                        report_content += "### Acceptable Discrepancies\n\n"
+                        for disc in acceptable:
+                            report_content += f"**{disc.get('description', 'Discrepancy')} [{disc.get('severity', 'MINOR')}] - ACCEPTABLE**\n\n"
+                            report_content += f"- **Severity:** {disc.get('severity', 'MINOR')}\n"
+                            report_content += f"- **Rationale:** {disc.get('rationale', 'No rationale provided')}\n\n"
             
             # Provide download button for markdown report
             st.download_button(
