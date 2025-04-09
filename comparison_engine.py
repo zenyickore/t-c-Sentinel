@@ -5,13 +5,6 @@ import re
 import fitz  # PyMuPDF
 from typing import List, Dict, Any, Optional, Tuple
 from dotenv import load_dotenv
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.vectorstores import Chroma
-from langchain.chat_models import ChatOpenAI
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
-from langchain.retrievers import ContextualCompressionRetriever
-from langchain.retrievers.document_compressors import LLMChainExtractor
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,6 +12,125 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
+
+# Try to import optional dependencies
+try:
+    from langchain.embeddings.openai import OpenAIEmbeddings
+    OPENAI_AVAILABLE = True
+except (ImportError, Exception) as e:
+    logger.warning(f"OpenAI embeddings not available: {str(e)}")
+    OPENAI_AVAILABLE = False
+
+try:
+    from langchain.chat_models import ChatOpenAI
+    CHATGPT_AVAILABLE = True
+except (ImportError, Exception) as e:
+    logger.warning(f"ChatGPT not available: {str(e)}")
+    CHATGPT_AVAILABLE = False
+
+try:
+    import torch
+    from transformers import AutoTokenizer, AutoModel, pipeline
+    TRANSFORMERS_AVAILABLE = True
+except ImportError as e:
+    logger.error(f"Transformers not available: {str(e)}")
+    TRANSFORMERS_AVAILABLE = False
+
+try:
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    GEMINI_AVAILABLE = True
+except (ImportError, Exception) as e:
+    logger.warning(f"Google Gemini not available: {str(e)}")
+    GEMINI_AVAILABLE = False
+
+# Import the rest of the dependencies
+from langchain.vectorstores import Chroma
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import LLMChainExtractor
+from langchain.embeddings.base import Embeddings
+
+class HuggingFaceEmbeddings(Embeddings):
+    """
+    A class to provide embeddings using Hugging Face's transformers library directly.
+    This avoids the need for sentence-transformers and uses the transformers package
+    that's already installed for the Saul model.
+    """
+    
+    def __init__(self, model_name: str = "sentence-transformers/all-mpnet-base-v2"):
+        """
+        Initialize the HuggingFaceEmbeddings with the specified model.
+        
+        Args:
+            model_name: Name of the Hugging Face model to use for embeddings
+        """
+        if not TRANSFORMERS_AVAILABLE:
+            raise ImportError("transformers and torch are required for HuggingFaceEmbeddings")
+            
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.model = AutoModel.from_pretrained(model_name)
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.model.to(self.device)
+            logger.info(f"Initialized Hugging Face embeddings model: {model_name} on {self.device}")
+        except Exception as e:
+            logger.error(f"Failed to initialize Hugging Face embeddings model: {str(e)}")
+            raise RuntimeError(f"Failed to initialize embeddings model: {str(e)}")
+    
+    def _get_embedding(self, text: str) -> List[float]:
+        """
+        Generate an embedding for a single text.
+        
+        Args:
+            text: Text to embed
+            
+        Returns:
+            Embedding for the text
+        """
+        # Tokenize and prepare for the model
+        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        # Get the embeddings
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        
+        # Mean pooling - take average of all token embeddings
+        token_embeddings = outputs.last_hidden_state
+        attention_mask = inputs['attention_mask']
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        mean_embeddings = sum_embeddings / sum_mask
+        
+        # Convert to list and return
+        return mean_embeddings.cpu().numpy()[0].tolist()
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """
+        Generate embeddings for a list of documents.
+        
+        Args:
+            texts: List of document texts to embed
+            
+        Returns:
+            List of embeddings, one for each document
+        """
+        return [self._get_embedding(text) for text in texts]
+    
+    def embed_query(self, text: str) -> List[float]:
+        """
+        Generate an embedding for a query.
+        
+        Args:
+            text: Query text to embed
+            
+        Returns:
+            Embedding for the query
+        """
+        return self._get_embedding(text)
 
 class ModelProvider:
     """
@@ -30,7 +142,7 @@ class ModelProvider:
         Initialize the ModelProvider with the specified model type.
         
         Args:
-            model_type: Type of model to use ('openai' or 'saul')
+            model_type: Type of model to use ('openai', 'gemini', or 'saul')
             temperature: Temperature setting for the LLM
         """
         self.model_type = model_type
@@ -39,45 +151,125 @@ class ModelProvider:
     
     def _initialize_model(self):
         """Initialize the appropriate model based on model_type."""
-        if self.model_type == "openai":
-            self.llm = ChatOpenAI(
-                temperature=self.temperature,
-                model_name="gpt-4",  # Can be configured based on requirements
-                request_timeout=120  # Add timeout of 120 seconds per request
-            )
-            logger.info("Initialized OpenAI GPT-4 model")
-        elif self.model_type == "saul":
-            # Import necessary libraries for Saul model
+        if self.model_type == "openai" and CHATGPT_AVAILABLE:
             try:
-                import torch
-                from transformers import pipeline
-                
-                # Initialize the Saul model pipeline
-                self.pipeline = pipeline(
-                    "text-generation", 
-                    model="Equall/Saul-Instruct-v1", 
-                    torch_dtype=torch.bfloat16, 
-                    device_map="auto"
-                )
-                logger.info("Initialized Saul-Instruct-v1 model")
-            except ImportError as e:
-                logger.error(f"Failed to import required libraries for Saul model: {str(e)}")
-                # Fallback to OpenAI
-                self.model_type = "openai"
+                # Check for API key
+                api_key = os.environ.get("OPENAI_API_KEY")
+                if not api_key:
+                    raise ValueError("OPENAI_API_KEY environment variable not set")
+                    
                 self.llm = ChatOpenAI(
                     temperature=self.temperature,
-                    model_name="gpt-4",
-                    request_timeout=120
+                    model_name="gpt-4",  # Can be configured based on requirements
+                    request_timeout=120,  # Add timeout of 120 seconds per request
+                    openai_api_key=api_key
                 )
-                logger.warning("Falling back to OpenAI GPT-4 model due to import error")
+                logger.info("Initialized OpenAI GPT-4 model")
+            except Exception as e:
+                logger.error(f"Failed to initialize OpenAI model: {str(e)}")
+                self._fallback_to_available_model()
+        elif self.model_type == "gemini" and GEMINI_AVAILABLE:
+            try:
+                # Check for API key
+                api_key = os.environ.get("GOOGLE_API_KEY")
+                if not api_key:
+                    raise ValueError("GOOGLE_API_KEY environment variable not set")
+                    
+                self.llm = ChatGoogleGenerativeAI(
+                    model="gemini-1.5-pro",
+                    temperature=self.temperature,
+                    google_api_key=api_key,
+                    timeout=120
+                )
+                logger.info("Initialized Google Gemini model")
+            except Exception as e:
+                logger.error(f"Failed to initialize Gemini model: {str(e)}")
+                self._fallback_to_available_model()
+        elif self.model_type == "saul" and TRANSFORMERS_AVAILABLE:
+            self._initialize_saul_model()
         else:
-            logger.warning(f"Unknown model type: {self.model_type}, defaulting to OpenAI")
-            self.model_type = "openai"
-            self.llm = ChatOpenAI(
-                temperature=self.temperature,
-                model_name="gpt-4",
-                request_timeout=120
-            )
+            logger.warning(f"Unknown or unavailable model type: {self.model_type}")
+            self._fallback_to_available_model()
+    
+    def _fallback_to_available_model(self):
+        """Fallback to any available model."""
+        if CHATGPT_AVAILABLE:
+            try:
+                api_key = os.environ.get("OPENAI_API_KEY")
+                if api_key:
+                    logger.info("Falling back to OpenAI GPT-4 model")
+                    self.model_type = "openai"
+                    self.llm = ChatOpenAI(
+                        temperature=self.temperature,
+                        model_name="gpt-4",
+                        request_timeout=120,
+                        openai_api_key=api_key
+                    )
+                    return
+            except Exception:
+                pass
+                
+        if GEMINI_AVAILABLE:
+            try:
+                api_key = os.environ.get("GOOGLE_API_KEY")
+                if api_key:
+                    logger.info("Falling back to Google Gemini model")
+                    self.model_type = "gemini"
+                    self.llm = ChatGoogleGenerativeAI(
+                        model="gemini-1.0-pro",
+                        temperature=self.temperature,
+                        google_api_key=api_key,
+                        timeout=120
+                    )
+                    return
+            except Exception:
+                pass
+                
+        if TRANSFORMERS_AVAILABLE:
+            logger.info("Falling back to Saul model")
+            self.model_type = "saul"
+            self._initialize_saul_model()
+            return
+            
+        raise RuntimeError("No available models to use. Please ensure at least one of the API keys (OPENAI_API_KEY or GOOGLE_API_KEY) is set or that the transformers library is installed for the Saul model.")
+    
+    def _initialize_saul_model(self):
+        """Initialize the Saul model pipeline."""
+        if not TRANSFORMERS_AVAILABLE:
+            raise ImportError("transformers and torch are required for Saul model")
+            
+        try:
+            # Initialize the Saul model pipeline
+            model_name = "Equall/Saul-Instruct-v1"
+            
+            # Check if model exists locally first
+            try:
+                self.pipeline = pipeline(
+                    "text-generation", 
+                    model=model_name, 
+                    torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+                    device_map="auto"
+                )
+            except Exception:
+                # If model doesn't exist locally, try to download with specific parameters
+                from huggingface_hub import snapshot_download
+                model_path = snapshot_download(
+                    repo_id=model_name,
+                    local_files_only=False,
+                    resume_download=True
+                )
+                
+                self.pipeline = pipeline(
+                    "text-generation", 
+                    model=model_path, 
+                    torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+                    device_map="auto"
+                )
+                
+            logger.info("Initialized Saul-Instruct-v1 model")
+        except Exception as e:
+            logger.error(f"Failed to initialize Saul model: {str(e)}")
+            self._fallback_to_available_model()
     
     def run_chain(self, prompt: PromptTemplate, **kwargs) -> str:
         """
@@ -92,6 +284,10 @@ class ModelProvider:
         """
         if self.model_type == "openai":
             # Use LangChain for OpenAI
+            chain = LLMChain(llm=self.llm, prompt=prompt)
+            return chain.run(**kwargs)
+        elif self.model_type == "gemini":
+            # Use LangChain for Gemini
             chain = LLMChain(llm=self.llm, prompt=prompt)
             return chain.run(**kwargs)
         elif self.model_type == "saul":
@@ -130,12 +326,12 @@ class ModelProvider:
     def get_llm(self):
         """
         Get the LLM instance for use with LangChain components.
-        Only applicable for OpenAI models.
+        Only applicable for OpenAI and Gemini models.
         
         Returns:
             The LLM instance
         """
-        if self.model_type == "openai":
+        if self.model_type in ["openai", "gemini"]:
             return self.llm
         else:
             raise ValueError(f"Direct LLM access not available for model type: {self.model_type}")
@@ -145,24 +341,28 @@ class ComparisonEngine:
     A class for comparing legal documents using RAG (Retrieval Augmented Generation).
     """
     
-    def __init__(self, temperature: float = 0.0, persist_directory: str = "./chroma_db", model_type: str = "openai"):
+    def __init__(self, temperature: float = 0.0, persist_directory: str = "./chroma_db", model_type: str = "openai", embedding_model: str = "openai"):
         """
         Initialize the ComparisonEngine with necessary components.
         
         Args:
             temperature: Temperature setting for the LLM
             persist_directory: Directory to persist vector databases
-            model_type: Type of model to use ('openai' or 'saul')
+            model_type: Type of model to use for comparison ('openai', 'gemini', or 'saul')
+            embedding_model: Type of model to use for embeddings ('openai', 'gemini', or 'huggingface')
         """
-        # Initialize OpenAI embeddings
-        self.embeddings = OpenAIEmbeddings()
-        
-        # Initialize model provider
-        self.model_provider = ModelProvider(model_type=model_type, temperature=temperature)
+        # Store the embedding model type for later reference
+        self.embedding_model_type = embedding_model
         
         # Set persistence directory
         self.persist_directory = persist_directory
         os.makedirs(persist_directory, exist_ok=True)
+        
+        # Initialize embeddings based on the specified model
+        self._initialize_embeddings(embedding_model)
+        
+        # Initialize model provider
+        self.model_provider = ModelProvider(model_type=model_type, temperature=temperature)
         
         # Categories for comparison
         self.comparison_categories = [
@@ -178,6 +378,67 @@ class ComparisonEngine:
             "Amendment procedures"
         ]
     
+    def _initialize_embeddings(self, embedding_model: str):
+        """
+        Initialize embeddings based on the specified model.
+        
+        Args:
+            embedding_model: Type of model to use for embeddings ('openai', 'gemini', or 'huggingface')
+        """
+        if embedding_model == "openai" and OPENAI_AVAILABLE:
+            try:
+                # Check for API key
+                api_key = os.environ.get("OPENAI_API_KEY")
+                if not api_key:
+                    raise ValueError("OPENAI_API_KEY environment variable not set")
+                    
+                self.embeddings = OpenAIEmbeddings(openai_api_key=api_key)
+                logger.info("Using OpenAI embeddings")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to initialize OpenAI embeddings: {str(e)}")
+        
+        if embedding_model == "gemini" and GEMINI_AVAILABLE:
+            try:
+                # Check for API key
+                api_key = os.environ.get("GOOGLE_API_KEY")
+                if not api_key:
+                    raise ValueError("GOOGLE_API_KEY environment variable not set")
+                    
+                self.embeddings = GoogleGenerativeAIEmbeddings(
+                    model="models/embedding-001",
+                    google_api_key=api_key
+                )
+                logger.info("Using Google Gemini embeddings")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to initialize Gemini embeddings: {str(e)}")
+        
+        # Fall back to HuggingFace embeddings if other options fail
+        self._initialize_local_embeddings()
+    
+    def _initialize_local_embeddings(self):
+        """Initialize local embeddings when cloud-based options are not available."""
+        try:
+            # First try to use sentence-transformers if available
+            try:
+                from langchain.embeddings import HuggingFaceEmbeddings as LangchainHFEmbeddings
+                
+                self.embeddings = LangchainHFEmbeddings(
+                    model_name="sentence-transformers/all-mpnet-base-v2"
+                )
+                logger.info("Using sentence-transformers embeddings (via LangChain)")
+                return
+            except ImportError:
+                pass
+                
+            # Fall back to our custom implementation
+            self.embeddings = HuggingFaceEmbeddings()
+            logger.info("Using custom HuggingFace embeddings implementation")
+        except Exception as e:
+            logger.error(f"Failed to initialize HuggingFace embeddings: {str(e)}")
+            raise RuntimeError(f"No embedding models available: {str(e)}")
+    
     def create_vector_db(self, document_chunks: List[str], namespace: str, persist: bool = False) -> Chroma:
         """
         Create a vector database from document chunks.
@@ -190,49 +451,162 @@ class ComparisonEngine:
         Returns:
             Chroma vector database
         """
-        persist_directory = f"{self.persist_directory}/{namespace}" if persist else None
+        # Check if we need to recreate the database due to embedding model change
+        embedding_model_file = os.path.join(self.persist_directory, f"{namespace}_embedding_model.txt")
         
-        # Check if persistent DB already exists
-        if persist and os.path.exists(persist_directory):
-            logger.info(f"Loading existing vector database for {namespace}")
-            return Chroma(
-                embedding_function=self.embeddings,
-                collection_name=f"document_{namespace}",
-                persist_directory=persist_directory
-            )
+        # If the vector database exists, check if it was created with a different embedding model
+        if persist and os.path.exists(os.path.join(self.persist_directory, namespace)) and os.path.exists(embedding_model_file):
+            with open(embedding_model_file, 'r') as f:
+                stored_model = f.read().strip()
+                
+            # If the embedding model has changed, we need to delete the existing database
+            if stored_model != self.embedding_model_type:
+                logger.info(f"Embedding model changed from {stored_model} to {self.embedding_model_type}. Recreating vector database.")
+                self.delete_vector_db(namespace)
         
-        logger.info(f"Creating new vector database for {namespace}")
-        db = Chroma.from_texts(
-            texts=document_chunks,
-            embedding=self.embeddings,
-            collection_name=f"document_{namespace}",
-            persist_directory=persist_directory
-        )
+        # Import ChromaDB client here to ensure proper initialization
+        from chromadb.config import Settings
+        import chromadb
         
+        # Create the vector database
         if persist:
-            logger.info(f"Persisting vector database for {namespace}")
-            db.persist()
+            # Create a persistent vector database with explicit client settings
+            chroma_client = chromadb.PersistentClient(
+                path=os.path.join(self.persist_directory, namespace),
+                settings=Settings(
+                    anonymized_telemetry=False,
+                    allow_reset=True
+                )
+            )
             
-        return db
+            # Create or get collection
+            try:
+                collection = chroma_client.get_or_create_collection(name=namespace)
+            except Exception as e:
+                logger.warning(f"Error getting collection, trying to create new: {str(e)}")
+                # If collection exists but is corrupted, try to delete and recreate
+                try:
+                    chroma_client.delete_collection(name=namespace)
+                    collection = chroma_client.create_collection(name=namespace)
+                except Exception as inner_e:
+                    logger.error(f"Failed to recreate collection: {str(inner_e)}")
+                    raise
+            
+            # Add documents to collection
+            ids = [str(i) for i in range(len(document_chunks))]
+            embeddings = self.embeddings.embed_documents(document_chunks)
+            
+            # Add documents in batches to avoid memory issues
+            batch_size = 100
+            for i in range(0, len(document_chunks), batch_size):
+                end_idx = min(i + batch_size, len(document_chunks))
+                collection.add(
+                    ids=ids[i:end_idx],
+                    embeddings=embeddings[i:end_idx],
+                    documents=document_chunks[i:end_idx],
+                    metadatas=[{"source": namespace} for _ in range(i, end_idx)]
+                )
+            
+            # Create LangChain Chroma wrapper
+            vector_db = Chroma(
+                client=chroma_client,
+                collection_name=namespace,
+                embedding_function=self.embeddings
+            )
+            
+            # Save the embedding model type
+            with open(embedding_model_file, 'w') as f:
+                f.write(self.embedding_model_type)
+                
+            logger.info(f"Created persistent vector database for {namespace} using {self.embedding_model_type} embeddings")
+        else:
+            # Create an in-memory vector database
+            chroma_client = chromadb.Client(Settings(
+                anonymized_telemetry=False,
+                allow_reset=True
+            ))
+            
+            # Create collection
+            collection = chroma_client.create_collection(name=namespace)
+            
+            # Add documents to collection
+            ids = [str(i) for i in range(len(document_chunks))]
+            embeddings = self.embeddings.embed_documents(document_chunks)
+            
+            # Add documents in batches to avoid memory issues
+            batch_size = 100
+            for i in range(0, len(document_chunks), batch_size):
+                end_idx = min(i + batch_size, len(document_chunks))
+                collection.add(
+                    ids=ids[i:end_idx],
+                    embeddings=embeddings[i:end_idx],
+                    documents=document_chunks[i:end_idx],
+                    metadatas=[{"source": namespace} for _ in range(i, end_idx)]
+                )
+            
+            # Create LangChain Chroma wrapper
+            vector_db = Chroma(
+                client=chroma_client,
+                collection_name=namespace,
+                embedding_function=self.embeddings
+            )
+            
+            logger.info(f"Created in-memory vector database for {namespace} using {self.embedding_model_type} embeddings")
+        
+        return vector_db
     
-    def load_master_vector_db(self) -> Optional[Chroma]:
+    def load_master_vector_db(self):
         """
         Load the master document vector database if it exists.
         
         Returns:
             Chroma vector database or None if it doesn't exist
         """
-        master_dir = f"{self.persist_directory}/master"
-        if os.path.exists(master_dir):
-            logger.info("Loading existing master document vector database")
-            return Chroma(
-                embedding_function=self.embeddings,
-                collection_name="document_master",
-                persist_directory=master_dir
-            )
-        return None
+        master_db_path = os.path.join(self.persist_directory, "master")
+        embedding_model_file = os.path.join(self.persist_directory, "master_embedding_model.txt")
+        
+        if os.path.exists(master_db_path) and os.path.isdir(master_db_path):
+            # Check if the embedding model has changed
+            if os.path.exists(embedding_model_file):
+                with open(embedding_model_file, 'r') as f:
+                    stored_model = f.read().strip()
+                
+                if stored_model != self.embedding_model_type:
+                    logger.warning(f"Master database was created with {stored_model} embeddings, but current model is {self.embedding_model_type}.")
+                    logger.warning("Cannot load master database with different embedding dimensions. Please recreate the master database.")
+                    return None
+            
+            try:
+                # Import ChromaDB client here to ensure proper initialization
+                from chromadb.config import Settings
+                import chromadb
+                
+                # Create client with explicit settings
+                chroma_client = chromadb.PersistentClient(
+                    path=master_db_path,
+                    settings=Settings(
+                        anonymized_telemetry=False,
+                        allow_reset=True
+                    )
+                )
+                
+                # Create Chroma wrapper
+                vector_db = Chroma(
+                    client=chroma_client,
+                    collection_name="master",
+                    embedding_function=self.embeddings
+                )
+                
+                logger.info("Loaded master vector database")
+                return vector_db
+            except Exception as e:
+                logger.error(f"Failed to load master vector database: {str(e)}")
+                return None
+        else:
+            logger.info("No master vector database found")
+            return None
     
-    def delete_vector_db(self, namespace: str) -> bool:
+    def delete_vector_db(self, namespace: str):
         """
         Delete a persisted vector database.
         
@@ -242,17 +616,25 @@ class ComparisonEngine:
         Returns:
             True if successful, False otherwise
         """
-        db_dir = f"{self.persist_directory}/{namespace}"
-        if os.path.exists(db_dir):
-            import shutil
-            try:
-                shutil.rmtree(db_dir)
-                logger.info(f"Deleted vector database for {namespace}")
-                return True
-            except Exception as e:
-                logger.error(f"Error deleting vector database: {str(e)}")
-                return False
-        return False
+        try:
+            db_path = os.path.join(self.persist_directory, namespace)
+            embedding_model_file = os.path.join(self.persist_directory, f"{namespace}_embedding_model.txt")
+            
+            # Delete the vector database directory if it exists
+            if os.path.exists(db_path) and os.path.isdir(db_path):
+                import shutil
+                shutil.rmtree(db_path)
+                logger.info(f"Deleted vector database: {namespace}")
+            
+            # Delete the embedding model file if it exists
+            if os.path.exists(embedding_model_file):
+                os.remove(embedding_model_file)
+                logger.info(f"Deleted embedding model file for: {namespace}")
+                
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete vector database {namespace}: {str(e)}")
+            return False
     
     def setup_retriever(self, vector_db: Chroma, k: int = 5) -> ContextualCompressionRetriever:
         """
@@ -265,7 +647,7 @@ class ComparisonEngine:
         Returns:
             Configured retriever
         """
-        # Base retriever
+        # Create a base retriever
         base_retriever = vector_db.as_retriever(search_kwargs={"k": k})
         
         # Document compressor for extracting relevant information
@@ -279,49 +661,29 @@ class ComparisonEngine:
         prompt = PromptTemplate(template=prompt_template, input_variables=["context"])
         
         # Use the appropriate LLM based on model type
-        if self.model_provider.model_type == "openai":
-            compressor = LLMChainExtractor.from_llm(
-                llm=self.model_provider.get_llm(),
-                prompt=prompt
-            )
-        else:
-            # For non-OpenAI models, we need a custom compressor
-            # This is a simplified version that doesn't use LangChain's LLMChainExtractor
-            from langchain.schema import Document
-            
-            class CustomCompressor:
-                def __init__(self, model_provider, prompt):
-                    self.model_provider = model_provider
-                    self.prompt = prompt
+        if self.model_provider.model_type in ["openai", "gemini"]:
+            try:
+                # Try to use the standard LLMChainExtractor
+                compressor = LLMChainExtractor.from_llm(
+                    llm=self.model_provider.get_llm(),
+                    prompt=prompt
+                )
                 
-                def compress_documents(self, documents, query):
-                    compressed_docs = []
-                    for doc in documents:
-                        try:
-                            compressed_text = self.model_provider.run_chain(
-                                self.prompt, 
-                                context=doc.page_content
-                            )
-                            compressed_docs.append(
-                                Document(
-                                    page_content=compressed_text,
-                                    metadata=doc.metadata
-                                )
-                            )
-                        except Exception as e:
-                            logger.error(f"Error compressing document: {str(e)}")
-                            compressed_docs.append(doc)  # Use original if compression fails
-                    return compressed_docs
-            
-            compressor = CustomCompressor(self.model_provider, prompt)
-        
-        # Create a contextual compression retriever
-        compression_retriever = ContextualCompressionRetriever(
-            base_compressor=compressor,
-            base_retriever=base_retriever
-        )
-        
-        return compression_retriever
+                # Create a contextual compression retriever
+                compression_retriever = ContextualCompressionRetriever(
+                    base_compressor=compressor,
+                    base_retriever=base_retriever
+                )
+                
+                return compression_retriever
+            except Exception as e:
+                logger.warning(f"Failed to create standard compressor: {str(e)}")
+                logger.info("Falling back to simple retriever without compression")
+                return base_retriever
+        else:
+            # For models that don't support the standard compressor, just return the base retriever
+            logger.info(f"Using simple retriever without compression for {self.model_provider.model_type} model")
+            return base_retriever
     
     def compare_documents(self, 
                          master_retriever: ContextualCompressionRetriever,

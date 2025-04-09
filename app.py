@@ -121,12 +121,43 @@ def main():
                                help="Higher values make output more random, lower values more deterministic")
         
         # Model selection
-        model_type = st.selectbox(
-            "Model Type",
-            options=["openai", "saul"],
+        st.subheader("Model Selection")
+        
+        # Comparison model selection
+        comparison_model = st.selectbox(
+            "Comparison Model",
+            options=["openai", "gemini", "saul"],
             index=0,
-            help="Select the model to use for analysis (OpenAI GPT-4 or Saul-Instruct-v1)"
+            help="Select the model to use for document comparison (OpenAI GPT-4, Google Gemini, or Saul-Instruct-v1)"
         )
+        
+        # Embedding model selection
+        embedding_model = st.selectbox(
+            "Embedding Model",
+            options=["openai", "gemini", "huggingface"],
+            index=0,
+            help="Select the model to use for text embeddings (OpenAI, Google Gemini, or HuggingFace)"
+        )
+        
+        # API key status indicators
+        st.subheader("API Key Status")
+        
+        openai_key = os.environ.get("OPENAI_API_KEY")
+        google_key = os.environ.get("GOOGLE_API_KEY")
+        
+        if openai_key:
+            st.success("OpenAI API Key: ✓ Available")
+        else:
+            st.error("OpenAI API Key: ✗ Missing")
+            if comparison_model == "openai" or embedding_model == "openai":
+                st.warning("You've selected OpenAI models but the API key is missing. Please add OPENAI_API_KEY to your .env file.")
+        
+        if google_key:
+            st.success("Google API Key: ✓ Available")
+        else:
+            st.error("Google API Key: ✗ Missing")
+            if comparison_model == "gemini" or embedding_model == "gemini":
+                st.warning("You've selected Google Gemini models but the API key is missing. Please add GOOGLE_API_KEY to your .env file.")
         
         # Master document management
         st.subheader("Master Document Management")
@@ -134,7 +165,7 @@ def main():
             st.success(f"Current master: {st.session_state.master_filename}")
             if st.button("Clear Master Document"):
                 # Initialize comparison engine
-                comparison_engine = ComparisonEngine(temperature=temperature, model_type=model_type)
+                comparison_engine = ComparisonEngine(temperature=temperature, model_type=comparison_model, embedding_model=embedding_model)
                 # Delete the master vector database
                 comparison_engine.delete_vector_db("master")
                 # Reset session state
@@ -166,7 +197,8 @@ def main():
     
     comparison_engine = ComparisonEngine(
         temperature=temperature,
-        model_type=model_type
+        model_type=comparison_model,
+        embedding_model=embedding_model
     )
     
     # Main content area
@@ -199,37 +231,25 @@ def main():
             if not st.session_state.has_master_document or st.session_state.master_filename != master_file.name:
                 if st.button("Set as Master Document"):
                     with st.spinner("Processing master document..."):
-                        # Process document
+                        # Create a temporary file to process
                         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
                             tmp_file.write(master_file.getvalue())
-                            master_path = tmp_file.name
-                            
-                            # Save a permanent copy
-                            os.makedirs("./master_documents", exist_ok=True)
-                            permanent_path = f"./master_documents/{master_file.name}"
-                            with open(permanent_path, 'wb') as f:
-                                f.write(master_file.getvalue())
+                            tmp_path = tmp_file.name
                         
-                        # Process document
-                        master_data = doc_processor.process_document(master_path)
+                        # Process the document
+                        full_text, page_texts = doc_processor.extract_text_from_pdf(tmp_path)
+                        document_chunks = doc_processor.split_text_into_chunks(full_text)
                         
-                        # Create vector database with persistence
-                        master_db = comparison_engine.create_vector_db(
-                            document_chunks=master_data["chunks"],
-                            namespace="master",
-                            persist=True
-                        )
+                        # Create vector database
+                        comparison_engine.create_vector_db(document_chunks, "master", persist=True)
                         
                         # Update session state
                         st.session_state.has_master_document = True
                         st.session_state.master_filename = master_file.name
-                        st.session_state.master_path = permanent_path
+                        st.session_state.master_path = tmp_path
                         
-                        # Clean up temporary file
-                        os.unlink(master_path)
-                    
-                    st.success(f"Set {master_file.name} as master document")
-                    st.rerun()
+                        st.success(f"Set {master_file.name} as master document")
+                        st.rerun()
     
     with col2:
         st.header("Client Document")
@@ -253,87 +273,65 @@ def main():
                         st.write(f"**{key}:** {value}")
                 else:
                     st.write("No metadata available")
-    
-    # Comparison section
-    st.markdown("---")
-    st.header("Document Comparison")
-    
-    # Check if we have a master document (either from session or newly uploaded)
-    has_master = st.session_state.has_master_document or master_file is not None
-    
-    if has_master and client_file:
-        if st.button("Compare Documents", type="primary"):
-            with st.spinner("Processing documents and performing comparison..."):
-                # Process master document if needed
-                if st.session_state.has_master_document:
-                    # Load existing master vector database
-                    master_db = comparison_engine.load_master_vector_db()
-                    master_path = st.session_state.master_path
-                    master_filename = st.session_state.master_filename
-                else:
-                    # Process new master document
+        
+        # Compare documents button
+        if st.session_state.has_master_document and client_file:
+            if st.button("Compare Documents"):
+                with st.spinner("Comparing documents..."):
+                    # Create a temporary file to process
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                        tmp_file.write(master_file.getvalue())
-                        master_path = tmp_file.name
+                        tmp_file.write(client_file.getvalue())
+                        client_path = tmp_file.name
                     
-                    # Process document
-                    master_data = doc_processor.process_document(master_path)
+                    # Process the client document
+                    client_text, client_page_texts = doc_processor.extract_text_from_pdf(client_path)
+                    client_chunks = doc_processor.split_text_into_chunks(client_text)
                     
-                    # Create vector database
-                    master_db = comparison_engine.create_vector_db(
-                        document_chunks=master_data["chunks"],
-                        namespace="master"
+                    # Create client vector database (in-memory)
+                    client_db = comparison_engine.create_vector_db(client_chunks, "client", persist=False)
+                    
+                    # Load master vector database
+                    master_db = comparison_engine.load_master_vector_db()
+                    
+                    # Check if master database was loaded successfully
+                    if master_db is None:
+                        st.error("Error: The master document was created with a different embedding model. Please re-upload the master document with the current embedding model.")
+                        # Add a button to clear the master document
+                        if st.button("Clear Master Document and Try Again"):
+                            comparison_engine.delete_vector_db("master")
+                            st.session_state.has_master_document = False
+                            st.session_state.master_filename = None
+                            st.session_state.master_path = None
+                            st.success("Master document cleared. Please upload it again.")
+                            st.rerun()
+                        return
+                    
+                    # Setup retrievers
+                    master_retriever = comparison_engine.setup_retriever(master_db, k=retrieval_k)
+                    client_retriever = comparison_engine.setup_retriever(client_db, k=retrieval_k)
+                    
+                    # Compare documents
+                    comparison_results = comparison_engine.compare_documents(
+                        master_retriever=master_retriever,
+                        client_retriever=client_retriever
                     )
                     
-                    master_filename = master_file.name
-                
-                # Process client document
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                    tmp_file.write(client_file.getvalue())
-                    client_path = tmp_file.name
-                
-                # Process client document
-                client_data = doc_processor.process_document(client_path)
-                
-                # Create client vector database
-                client_db = comparison_engine.create_vector_db(
-                    document_chunks=client_data["chunks"],
-                    namespace="client"
-                )
-                
-                # Set up retrievers
-                master_retriever = comparison_engine.setup_retriever(
-                    vector_db=master_db,
-                    k=retrieval_k
-                )
-                
-                client_retriever = comparison_engine.setup_retriever(
-                    vector_db=client_db,
-                    k=retrieval_k
-                )
-                
-                # Perform comparison
-                comparison_results = comparison_engine.compare_documents(
-                    master_retriever=master_retriever,
-                    client_retriever=client_retriever
-                )
-                
-                # Store results in session state
-                st.session_state.comparison_results = comparison_results
-                st.session_state.master_filename = master_filename
-                st.session_state.client_filename = client_file.name
-                st.session_state.client_path = client_path
-                
-                # Don't delete master_path if it's the persistent one
-                if not st.session_state.has_master_document and master_file:
-                    os.unlink(master_path)
-            
-            st.success("Comparison completed!")
-    else:
-        if not has_master:
-            st.info("Please upload or set a master document")
-        if not client_file:
-            st.info("Please upload a client document")
+                    # Store results in session state
+                    st.session_state.comparison_results = comparison_results
+                    st.session_state.master_filename = master_file.name
+                    st.session_state.client_filename = client_file.name
+                    st.session_state.client_path = client_path
+                    
+                    # Don't delete master_path if it's the persistent one
+                    if not st.session_state.has_master_document and master_file:
+                        os.unlink(master_path)
+                    
+                st.success("Comparison completed!")
+        else:
+            if not st.session_state.has_master_document:
+                st.info("Please upload or set a master document")
+            if not client_file:
+                st.info("Please upload a client document")
     
     # Display results if available
     if "comparison_results" in st.session_state:
